@@ -1,692 +1,147 @@
-'''
-For Blender 2.9
-Written by Yusheng Wang, wang@robot.t.u-tokyo.ac.jp, 2021.4.30
-'''
-#import libraries
+import sys
+import time
+import cv2 as cv
+import OpenEXR
 import os
 import bpy
 import numpy as np
-import sys
-import OpenEXR
-import math
-import mathutils
-import cv2 as cv
-import time
-from mathutils import Matrix
-from mathutils import Vector
+from pathlib import Path
+from einops import rearrange
+import scipy.io as sio
+from scipy.spatial.transform import Rotation as R
+
+curr_py_path = Path(__file__)
+sys.path.append(str(curr_py_path.parent))
+
+from angle_table import angle_table
 
 
-print("********************************************************************************************")
-##change here!!!
-###some important parameters here
-## set the uplimit and lowlimit of the image i.e. sensing range
-#GLOBAL VARIABLES
-uplimit=4.5 #4.336
-lowlimit=0.7 #4.336
-resolution=0.003
-imagewidth=int(1280)
-imageheight=int(560)
-scale=1#10
-scaledimagewidth=int(imagewidth/scale)
-normalthres=0.02
-max_integration=3
+# Parameters
+near_bound = 0.7
+far_bound = 4.7
+bearing_fov = np.deg2rad(angle_table.ac.max()-angle_table.ac.min())
+vertical_fov = np.deg2rad(14.0)
+nbeams = 96  # ARIS 1800 High Freq
+distance_resolution = 0.006
+nbins = int(np.round((far_bound-near_bound) / distance_resolution)) + 1
+real_res = (far_bound-near_bound)/(nbins-1)
+print("The real range resolution of sonar image is {}".format(real_res))
+frames_num = 50
 
-#######################################################################################
-#count time start
-time_start=time.time()
+# 路径
+base_path = "D:\\repos\\Sonar-simulator-blender\\Blender2.90\\"
+rendred_path = base_path + "rendered\\"
+sonar_path = base_path + "fls\\"
 
-def sceneRender():
-    #generate 1. depth image  2. grayscale image 3. normal map in world coordinate
-    #Use node
 
-    bpy.context.scene.use_nodes = True
-    tree = bpy.context.scene.node_tree
-    links = tree.links
+# count time start
+print(">> Program Starts")
+time_start = time.time()
 
-    # clear default nodes
-    for n in tree.nodes:
-        tree.nodes.remove(n)
+def renderOnce():
+    # 使用 Blender 的 GUI 设置作为主题，不需要额外设置节点等内容
+    bpy.ops.render.render(write_still=True)
 
-    # create input render layer node
-    rl = tree.nodes.new('CompositorNodeRLayers')
-    rl.location = 185,285    #what does this 'location' mean
 
-    # create output node
-    v = tree.nodes.new('CompositorNodeOutputFile')
-    v.location = 750,210
-    #v.use_alpha = False
-    v.base_path="D:\\repos\\Sonar-simulator-blender\\Blender2.90\\output\\depth\\"
+def imageGeneration(num):
+    # 文件名
+    rgb_filename = rendred_path + "RawImage0000.exr"
+    pos_filename = rendred_path + "RawPosition0000.exr"
 
-    o = tree.nodes.new('CompositorNodeOutputFile')
-    o.location=750,320
-    o.base_path="D:\\repos\\Sonar-simulator-blender\\Blender2.90\\output\\image\\"
-
-    n = tree.nodes.new('CompositorNodeOutputFile')
-    n.location=750,440
-    n.base_path="D:\\repos\\Sonar-simulator-blender\\Blender2.90\\output\\normal\\"
-
-    # Links
-    links.new(rl.outputs[2], v.inputs[0])  # link Image output to Viewer input
-    links.new(rl.outputs[0], o.inputs[0])
-    links.new(rl.outputs[4], n.inputs[0])
-
-    # render
-    bpy.ops.render.render()
-
-    #check how long it takes for saving and render
-    #time_end=time.time()
-    #print('render cost',time_end-time_start)
-
-################################################################################
-#print("image generated")
-def opticalimageGeneration(num):
-     #opencv read
-    fileNamergb = "D:\\repos\\Sonar-simulator-blender\\Blender2.90\\output\\image\\image0000.exr"
-    fileNamedepth = "D:\\repos\\Sonar-simulator-blender\\Blender2.90\\output\\depth\\image0000.exr"
-    fileNamenormal = "D:\\repos\\Sonar-simulator-blender\\Blender2.90\\output\\normal\\image0000.exr"
-    #im = cv.imread(fileName,0)
-    #cv.imshow('test', im)
-
-    #################################################################################
-    #rgb with exr
-    exrimage = OpenEXR.InputFile(fileNamergb)
-
-    dw = exrimage.header()['dataWindow']
-    (width, height) = (dw.max.x - dw.min.x + 1, dw.max.y - dw.min.y + 1)
-
+    # 读取 exr 函数
     def fromstr(s):
         mat = np.fromstring(s, dtype=np.float32)
         mat = mat.reshape (height,width)
         return mat
 
+    ### RGB ###
+    exrimage = OpenEXR.InputFile(rgb_filename)
+    dw = exrimage.header()['dataWindow']
+    (width, height) = (dw.max.x - dw.min.x + 1, dw.max.y - dw.min.y + 1)
     (r, g, b) = [fromstr(s) for s in exrimage.channels('RGB')]
-    img=r
-    arr=np.array(img)
-    #print(arr)
-    arr=arr/np.amax(arr)
-    #cv.resizeWindow('test',128,56)
-    #cv.imshow('testgrayscale', arr)
-    rr=np.array(r)
-    gg=np.array(g)
-    bb=np.array(b)
-    rgb=np.zeros([height,width,3],dtype=np.float32)
-    rgb[:, :, 0]=bb
-    rgb[:, :, 1]=gg
-    rgb[:, :, 2]=rr
 
+    intensity_img = np.array(r)
+    intensity_img = intensity_img/np.amax(intensity_img)
+    intensity_img = rearrange(intensity_img, 'h w -> (h w)')
 
-    ################################################################################
-    #depth with exr
-    exrimage = OpenEXR.InputFile(fileNamedepth)
-
+    ### POSITION ###
+    exrimage = OpenEXR.InputFile(pos_filename)
     dw = exrimage.header()['dataWindow']
     (width, height) = (dw.max.x - dw.min.x + 1, dw.max.y - dw.min.y + 1)
-
-
-    (rd, gd, bd) = [fromstr(s) for s in exrimage.channels('RGB')]
-    img2=rd
-    #print(img2)
-    arr2=np.array(img2)
-
-    arr2=arr2/uplimit
-    #cv.resizeWindow('test2',128,56)
-    #cv.imshow('testdepth', arr2)
-    ##test
-    #print(arr2[554,2])
-    #print(arr2[554,640])
-
-    ##################################################################################
-    #normal with exr
-    exrimage = OpenEXR.InputFile(fileNamenormal)
-
-    dw = exrimage.header()['dataWindow']
-    (width, height) = (dw.max.x - dw.min.x + 1, dw.max.y - dw.min.y + 1)
-
-
-    (rn, gn, bn) = [fromstr(s) for s in exrimage.channels('RGB')]
-
-    imgrgb=np.zeros([height,width,3],dtype=np.float32)
-
-    img3=bn
-    arr3=np.array(img3)
-    arr3=arr3/np.max(arr3)
-    img4=gn
-    arr4=np.array(img4)
-    arr4=arr4/np.max(arr4)
-    img5=rn
-    arr5=np.array(img5)
-    arr5=arr5/np.max(arr5)
-    imgrgb[:, :, 0]=arr3
-    imgrgb[:, :, 1]=arr4
-    imgrgb[:, :, 2]=arr5
-    #cv.imshow('testrgb', imgrgb)
-
-    print("image read")
-    print('width',width)
-    print('height',height)
-
-
-    ######################################################################################
-    #put img into array
-    arrc=np.array(img)
-    arrd=np.array(img2)
-    arrb=np.array(img3)
-    arrg=np.array(img4)
-    arrr=np.array(img5)
-    arrrgb=np.zeros([height,width,3],dtype=np.float32)
-    arrrgb[:, :, 0]=arrb
-    arrrgb[:, :, 1]=arrg
-    arrrgb[:, :, 2]=arrr
-
-    path = "E:\\sim-data\\sim-291\\opti_front"+str(num+1)+".png"
-    cv.imwrite(path, 1.0/arrd*255)
-
-    path = "E:\\sim-data\\sim-291\\opti_if"+str(num+1)+".png"
-    cv.imwrite(path, rgb*255)
-
-    path = "E:\\sim-data\\sim-291\\opti_sfront"+str(num+1)+".txt"
-    np.savetxt(path,1.0/arrd)
-
-    #path = "D:\\self-a2fnet\\color_test\\opti_sif"+str(num+1)+".txt"
-    #np.savetxt(path,arrc)
-
-
-
-
-
-#@jit(nopython=True)
-def imageGeneration(num,k):   # num:number of iteration -> number of image
-
-    #opencv read
-    fileNamergb = "D:\\repos\\Sonar-simulator-blender\\Blender2.90\\output\\image\\image0000.exr"
-    fileNamedepth = "D:\\repos\\Sonar-simulator-blender\\Blender2.90\\output\\depth\\image0000.exr"
-    fileNamenormal = "D:\\repos\\Sonar-simulator-blender\\Blender2.90\\output\\normal\\image0000.exr"
-    #im = cv.imread(fileName,0)
-    #cv.imshow('test', im)
-
-    #################################################################################
-    #rgb with exr
-    exrimage = OpenEXR.InputFile(fileNamergb)
-
-    dw = exrimage.header()['dataWindow']
-    (width, height) = (dw.max.x - dw.min.x + 1, dw.max.y - dw.min.y + 1)
-
-    def fromstr(s):
-        mat = np.fromstring(s, dtype=np.float32)
-        mat = mat.reshape (height,width)
-        return mat
-
     (r, g, b) = [fromstr(s) for s in exrimage.channels('RGB')]
-    img=r
-    arr=np.array(img)
-    #print(arr)
-    arr=arr/np.amax(arr)
-    #cv.resizeWindow('test',128,56)
-    #cv.imshow('testgrayscale', arr)
-    rr=np.array(r)
-    gg=np.array(g)
-    bb=np.array(b)
-    rgb=np.zeros([height,width,3],dtype=np.float32)
-    rgb[:, :, 0]=bb
-    rgb[:, :, 1]=gg
-    rgb[:, :, 2]=rr
-
-    ################################################################################
-    #depth with exr
-    exrimage = OpenEXR.InputFile(fileNamedepth)
-
-    dw = exrimage.header()['dataWindow']
-    (width, height) = (dw.max.x - dw.min.x + 1, dw.max.y - dw.min.y + 1)
-
-
-    (rd, gd, bd) = [fromstr(s) for s in exrimage.channels('RGB')]
-
-    def dist2depth_img(rd, focal=2280.4170):
-        img_width = rd.shape[1]
-        img_height = rd.shape[0]
-
-        # Get x_i and y_i (distances from optical center)
-        cx = img_width // 2
-        cy = img_height // 2
-
-        xs = np.arange(img_width) - cx
-        ys = np.arange(img_height) - cy
-        xis, yis = np.meshgrid(xs, ys)
-
-        depth = np.sqrt((1+(xis ** 2 + yis ** 2)/(focal ** 2))*rd ** 2)
-
-
-        return depth
-
-
-
-    img2=rd
-    arrd=np.array(img2)
-    #print(img2)
-    arr2=np.array(img2)
-
-    arrd=dist2depth_img(arrd)
-    arr2=dist2depth_img(arr2)
-
-    arr2=arr2/uplimit
-    #cv.resizeWindow('test2',128,56)
-    #cv.imshow('testdepth', arr2)
-    ##test
-    #print(arr2[554,2])
-    #print(arr2[554,640])
-
-    ##################################################################################
-    #normal with exr
-    exrimage = OpenEXR.InputFile(fileNamenormal)
-
-    dw = exrimage.header()['dataWindow']
-    (width, height) = (dw.max.x - dw.min.x + 1, dw.max.y - dw.min.y + 1)
-
-
-    (rn, gn, bn) = [fromstr(s) for s in exrimage.channels('RGB')]
-
-    imgrgb=np.zeros([height,width,3],dtype=np.float32)
-
-    img3=bn
-    arr3=np.array(img3)
-    arr3=arr3/np.max(arr3)
-    img4=gn
-    arr4=np.array(img4)
-    arr4=arr4/np.max(arr4)
-    img5=rn
-    arr5=np.array(img5)
-    arr5=arr5/np.max(arr5)
-    imgrgb[:, :, 0]=arr3
-    imgrgb[:, :, 1]=arr4
-    imgrgb[:, :, 2]=arr5
-    #cv.imshow('testrgb', arr3)
-
-    print("image read")
-    print('width',width)
-    print('height',height)
-
-
-    ######################################################################################
-    #put img into array
-    arrc=np.array(img)
-
-    arrb=np.array(img3)
-    arrg=np.array(img4)
-    arrr=np.array(img5)
-    arrrgb=np.zeros([height,width,3],dtype=np.float32)
-    arrrgb[:, :, 0]=arrb
-    arrrgb[:, :, 1]=arrg
-    arrrgb[:, :, 2]=arrr
-    #print(len(rd))
-    #print(arrd)
-    dmax=np.amax(arrd)
-    dmin=np.amin(arrd)
-    print('max distances:',dmax)
-    print('min distances:',dmin)
-    length=np.floor((uplimit-lowlimit)/resolution)
-    length=int(length)
-    print(length)
-
-    #################################################################################################################################
-     ##################################################################################
-    #resize image will lead to some sample problem, for high resolution image, this part is not needed
-    #this part is difficult, to be improved
-    print("resize image")
-    rawd0=np.zeros((imageheight*imagewidth))
-    rawd0=rawd0.reshape(imageheight,imagewidth)
-    rawc0=np.zeros((imageheight*imagewidth))
-    rawc0=rawc0.reshape(imageheight,imagewidth)
-    for i in range(imageheight):
-        for j in range(scaledimagewidth):
-            j0=j*scale
-            rawd0[i,j]=arrd[i,j0]
-            rawc0[i,j]=arrc[i,j0]
-
-    #########################################################################################
-    #cv.imshow("depth",rawd0/np.max(rawd0))
-    #image generation
-    ##here is the most important part, no research processed this part well, it is about how to add the intensities on the same arc
-    ##change the mode to depth image generation or elevation angle image generation here
-
-    #arrraw=np.zeros(128*length,dtype=np.float32)
-    #arrraw=arrraw.reshape(length,128)
-    arrraw=np.zeros((length,scaledimagewidth))
-    ele=np.zeros((length,scaledimagewidth))
-
-    arrtensor=np.zeros((imageheight,length,scaledimagewidth))
-    rawd1=rawd0
-    count=np.zeros((length,scaledimagewidth))
-    container=np.zeros((length,scaledimagewidth),dtype=np.int)
-    intensitymax=np.amax(rawc0)
-    intensitymin=np.amin(rawc0)
-    para=1/intensitymax
-    #print(rawc0)
-    #print(para)
-    #add intensity
-    #container=-1
-    print(scaledimagewidth)
-    print(imageheight)
-    for j in range(scaledimagewidth):
-        for i in range(imageheight):
-            dp0=np.floor((rawd0[i,j]-lowlimit)/resolution)
-            dp=int(dp0)
-            ## maximum integration: 3 times
-
-            if dp>=length or dp<=0:
-                continue;
-
-
-            ## for the hitted points on the same arc. if the normal vector is larger than a threshold, then integrate the intensities
-            if arrraw[dp,j]>0 and i+1<imageheight and abs(arrrgb[container[dp,j], j, 0]-arrrgb[i,j,0])<normalthres and abs(arrrgb[container[dp,j], j, 1]-arrrgb[i,j,1])<normalthres and abs(arrrgb[container[dp,j], j, 2]-arrrgb[i,j,2])<normalthres:
-                #container=i
-                continue;
-            ## maximum integration: 3 times
-            if count[dp,j]<2:
-            #if i==container[dp,j]+1 or i==container[dp,j]+2:
-            #    continue;
-
-            #if arrraw[dp,j]==0:
-                #arrraw[dp,j]=i
-                #arrraw[dp,j]=dp*math.sin((-14+i/560*28)/180*math.pi)+length/2    # change the intensity to depth
-            #if arrraw[dp,j]>0:
-            #    if rawc0[i,j]<0.005:
-            #        continue;
-                arrtensor[i,dp,j]=1
-                  #add the intensity
-                #if arrraw[dp,j]==0:
-                    #ele1[dp,j]=i
-                #else:
-                    #ele2[dp,j]=i
-                ele[dp,j]=i
-                arrraw[dp,j]=rawc0[i,j]+arrraw[dp,j]
-           # arrraw[dp,j]=count[dp,j] #change the gray scale intensity to hit times
-            #arrraw[dp,j]=i # change the intensity to elevation angle
-            #arrraw[dp,j]=arrraw[dp,j]+1/(1+np.exp(-(rawc0[i,j])*para-0.5)*10)
-            #print(arrraw[dp,j])
-            #arrraw[dp,j]=rawc0[i,j]
-                count[dp,j]=count[dp,j]+1
-                container[dp,j]=int(i)
-            #print(arrrgb[container[dp,j], j, 0])
-
-
-    #writePath = "D:\\elevate-estimation\\rec-ele\\rec"+str(num+1)+".txt"
-
-
-
-    hit=np.zeros((length,scaledimagewidth))
-
-    for i in range(int(length)):
-        for j in range(scaledimagewidth):
-            hit[i,j]=count[i,j]
-            if hit[i,j]==4 or hit[i,j]==3:
-                hit[i,j]=2
-                print('wtf')
-            #if count[i,j]>1:
-                #arrraw[i,j]=arrraw[i,j]/1    #count[i,j]
-                #arrraw[i,j]=1+1/(1+np.exp(-(arrraw[i,j])*para-0.5)*10)
-                #arrraw[i,j]=arrraw[i,j]/1
-                #print(arrraw[i,j])
-                #print(count[i,j])
-
-    #smoothing, fill some holes due to aliasing
-    #for i in range(int(length)):
-        #for j in range(scaledimagewidth):
-            #if arrraw[i,j]<0.005 and i>2 and i+2 < int(length):
-                #xm = 1
-                #arrraw[i,j]=(arrraw[i-2,j]+arrraw[i-1,j]+arrraw[i+1,j]+arrraw[i+2,j])/4
-                #hit[i,j]=(hit[i-2,j]+hit[i-1,j]+hit[i+1,j]+hit[i+2,j])/4.0
-                #arrraw[i,j]=arrraw[i,j]
-    #========================================================
-    #To generate fan-shaped image
-    width=int(uplimit/resolution*np.sin(32/180*math.pi))
-    print('width=',width)
-    length2=int(uplimit/resolution)
-    print('length2=',length2)
-    #sample_interval=7.5/0.003*0.25/180*pi
-    #width=int(width/sample_interval)
-    #print('width=',width)
-    raw2fan0=np.zeros((length2,width))
-    #raw2fan0=arrraw/np.amax(arrraw)
-    for i in range(length2):
-        for j in range(width):
-            root_squared=math.sqrt(i*i+j*j)
-            idx=int(root_squared-lowlimit/resolution)
-            if idx>0:
-                azi=int(scaledimagewidth*180/32/math.pi*math.acos(i/root_squared))
-                if idx>length-1 or azi>scaledimagewidth-1:
-                    continue;
-                raw2fan0[i,j]=arrraw[idx,azi]
-
-
-
-    #cv.imshow('fana',raw2fan0/np.amax(raw2fan0))
-    #save fanshaped image
-    #cv.imwrite('C:\\Users\\wang\\AppData\\Roaming\\Blender Foundation\\Blender\\2.80\\config\\BlenderPython\\result\\fan99.jpg', raw2fan0/np.amax(arrraw)*255)
-    #######################################################
-    #rotate fanshaped image
-
-    width2=int(length2*math.cos(74/180*math.pi)*2)
-    offset=int(length2-length2*math.sin(74/180*math.pi))
-    length3=int(length2+offset)
-    xcenter=0;
-    ycenter=int(length2);
-    degrees=16;
-    halfwidth2=int(width2/2)
-    fan1=np.zeros((length3,width2))
-    for i in range(length3):
-        for j in range(width2):
-            px=int((j-xcenter)*math.cos(degrees/180*math.pi)+(i-ycenter)*math.sin(degrees/180*math.pi)+xcenter)
-            py=int(-(j-xcenter)*math.sin(degrees/180*math.pi)+(i-ycenter)*math.cos(degrees/180*math.pi)+ycenter)
-            if px<0 or px>width-1 or py>length2-1 or py<0:
-                continue;
-            if i-offset>0:
-                fan1[i-offset,j]=raw2fan0[py,px]
-
-
-    #delete white edge
-    fan1=fan1[0:length2-1,:]
-    fan1=cv.flip(fan1,0)
-    fan1=cv.flip(fan1,1)
-    #################################################################################################################################
-    #raw image
-    #cv.imshow('rawsonar',arrraw/np.amax(arrraw))
-    #save raw and resized sonar images
-    savePath = "D:\\repos\\Sonar-simulator-blender\\Blender2.90\\output\\sonar\\rawimg_"+str(num+1)+"_"+str(k)+".png"
-    savePath1 = "D:\\repos\\Sonar-simulator-blender\\Blender2.90\\output\\sonar\\resizeimg_"+str(num+1)+"_"+str(k)+".png"
-    savePath2 = "D:\\repos\\Sonar-simulator-blender\\Blender2.90\\output\\sonar\\fanshaped_"+str(num+1)+"_"+str(k)+".png"
-    savePath3 = "D:\\repos\\Sonar-simulator-blender\\Blender2.90\\output\\sonar\\hit"+str(num+1)+".jpg"
-    savePath4 = "D:\\repos\\Sonar-simulator-blender\\Blender2.90\\output\\sonar\\hit_resize"+str(num+1)+".jpg"
-    savePath5 = "D:\\repos\\Sonar-simulator-blender\\Blender2.90\\output\\sonar\\ele_"+str(num+1)+"_"+str(k)+".png"
-    savePath6 = "D:\\repos\\Sonar-simulator-blender\\Blender2.90\\output\\sonar\\ele_resize_"+str(num+1)+"_"+str(k)+".png"
-
-    cv.imwrite(savePath, arrraw/1.0*255)  #np.amax(arrraw)  0.5 #0.7
-    print(np.amax(arrraw))
-    print(np.amax(hit))
-    cv.imwrite(savePath3, hit/2*255)
-
-    cv.imwrite(savePath5, ele/560*255)
-
-
-
-    #rescale raw image
-    raw = cv.imread(savePath,0)
-    rescale_raw = cv.resize(raw, dsize=(int(scaledimagewidth/10), int(length)),interpolation=cv.INTER_CUBIC)
-    cv.imwrite(savePath1, rescale_raw)
-
-    hit_raw = cv.imread(savePath3,0)
-    hit_rescale_raw = cv.resize(hit_raw, dsize=(int(scaledimagewidth/10), int(length)),interpolation=cv.INTER_CUBIC)
-    cv.imwrite(savePath4, hit_rescale_raw)
-
-    ele1_raw = cv.imread(savePath5,0)
-    ele1_rescale_raw = cv.resize(ele1_raw, dsize=(int(scaledimagewidth/10), int(length)),interpolation=cv.INTER_CUBIC)
-    cv.imwrite(savePath6, ele1_rescale_raw)
-
-
-
-
-    #path = "E:\\a2fnet-self\\sim-sequence-x\\0\\front"+str(num+1)+".png"
-    #cv.imwrite(path, 1.0/arrd*255)
-
-    path = "D:\\repos\\Sonar-simulator-blender\\Blender2.90\\output\\sonar\\acoustic_if_"+str(num+1)+"_"+str(k)+".png"
-    cv.imwrite(path, rgb/1.0*255) #0.7
-
-    #path = "D:\\self-a2fnet\\jde-ac\\sfront"+str(num+1)+".txt"
-    #np.savetxt(path,1.0/arrd)
-
-    #path = "D:\\self-a2fnet\\color_test\\sif"+str(num+1)+".txt"
-    #np.savetxt(path,arrc)
-    cv.imwrite(savePath2,fan1/1.0*255) #0.7
-
-
-
-
-
-
-
-##delete fan-shaped image generation
-##Check it in watertanksimulation_1212.blend
-
-#camera = bpy.data.objects['Camera']
-#camera.rotation_euler[0] = 35 / 180 * math.pi
-#camera.rotation_euler[1] = 0
-#camera.rotation_euler[2] = 90 / 180 * math.pi
-##======================
-#camera.location.x = 3.8
-#camera.location.y = 3.3
-#camera.rotation_euler[2] = 3.14159/2.0
-
-
-#camera = bpy.context.active_object
-#bpy.ops.transform.rotate(value=0.005*math.pi, orient_axis='Z')
-#outpath = "C:\\Users\\liu_d\\AppData\\Roaming\\Blender Foundation\\Blender\\2.80\\config\\BlenderPython\\test\\"
-
-
-
-#path2label = "D:\\BlenderPython\\rec-ele\\label.txt"
-
-#f = open(path2label,'w')
-def get_calibration_matrix_K_from_blender(camd):
-    f_in_mm = camd.lens
-    scene = bpy.context.scene
-    resolution_x_in_px = scene.render.resolution_x
-    resolution_y_in_px = scene.render.resolution_y
-    scale = scene.render.resolution_percentage / 100
-    sensor_width_in_mm = camd.sensor_width
-    sensor_height_in_mm = camd.sensor_height
-    pixel_aspect_ratio = scene.render.pixel_aspect_x / scene.render.pixel_aspect_y
-    if (camd.sensor_fit == 'VERTICAL'):
-        # the sensor height is fixed (sensor fit is horizontal),
-        # the sensor width is effectively changed with the pixel aspect ratio
-        s_u = resolution_x_in_px * scale / sensor_width_in_mm / pixel_aspect_ratio
-        s_v = resolution_y_in_px * scale / sensor_height_in_mm
-    else: # 'HORIZONTAL' and 'AUTO'
-        # the sensor width is fixed (sensor fit is horizontal),
-        # the sensor height is effectively changed with the pixel aspect ratio
-        pixel_aspect_ratio = scene.render.pixel_aspect_x / scene.render.pixel_aspect_y
-        s_u = resolution_x_in_px * scale / sensor_width_in_mm
-        s_v = resolution_y_in_px * scale * pixel_aspect_ratio / sensor_height_in_mm
-
-
-    # Parameters of intrinsic calibration matrix K
-    alpha_u = f_in_mm * s_u
-    alpha_v = f_in_mm * s_v
-    u_0 = resolution_x_in_px * scale / 2
-    v_0 = resolution_y_in_px * scale / 2
-    skew = 0 # only use rectangular pixels
-
-    K = Matrix(
-        ((alpha_u, skew,    u_0),
-        (    0  , alpha_v, v_0),
-        (    0  , 0,        1 )))
-    return K
-
-
-
-camera = bpy.data.objects['Camera']
-#target = bpy.data.objects['Plane']
-# camera.location.x = 0.8 #2.3
-# camera.location.y = 0.0
-# camera.location.z = 1.0 #2.1
-
-# camera.rotation_euler[0] = 65/180*3.14159  #51
-# camera.rotation_euler[1] = 0
-# camera.rotation_euler[2] = 90/180*3.14159
-
-
-area_light = bpy.data.objects['Area']
-area_light.data.energy=0.0
-
-def clockwise(camera):
-    camera.rotation_euler[2] = camera.rotation_euler[2] + 3/180*3.14159
-
-def unclockwise(camera):
-    camera.rotation_euler[2] = camera.rotation_euler[2] - 3/180*3.14159
-
-def move(camera):
-    camera.location.x = camera.location.x -0.1
-
-np.random.seed(0)
-flag = 0
-path="D:\\repos\\Sonar-simulator-blender\\Blender2.90\\output\\sonar\\motion.txt"
-f=open(path,mode="w")
-
-for i in range(1):  #loop for generating images
-    print("start!!!!!!!!!!!!!!!!!!!!!!!")
-
-    # camera.location.x = 0.8 #2.3
-    # camera.location.y = 0.0
-    # camera.location.z = 1.5 #2.1 2.5
-
-    # camera.rotation_euler[0] = 51/180*3.14159  #51
-    # camera.rotation_euler[1] = 0
-    # camera.rotation_euler[2] = 90/180*3.14159
-
-    # camera.location.x = 0.8-np.random.rand()*2.0
-    # camera.location.y = 0+(np.random.rand()*2-1)*4.0
-
-
-    spot_light = bpy.data.objects['Spot.000']
-    spot_light.data.energy=1.0
-
-    #bpy.context.scene.camera = bpy.context.scene.objects["Camera.002"]
-    #sceneRender()
-    #opticalimageGeneration(i)
-
-    #cam = bpy.data.objects['Camera.002']
-    #print(get_calibration_matrix_K_from_blender(cam.data))
-
-    #generate sonar image according to current camera perspective
-
-
-    cam = bpy.data.objects['Camera']
-    print(get_calibration_matrix_K_from_blender(cam.data))
-
-
-    bpy.context.scene.camera = bpy.context.scene.objects["Camera"]
-    sceneRender()
-    imageGeneration(i,0)
-    #camera.rotation_euler[0] += 0.1/180 * math.pi
-
-
-    mot1=(np.random.rand()+1)*0.05
-    mot2=(np.random.rand()+1)*0.05
-
-    camera.location.x = camera.location.x - mot1
-    #camera.location.x = camera.location.x -0.1/np.cos(39.0/180.0*math.pi)
-    #camera.location.z = camera.location.z +0.1*np.tan(39.0/180.0*math.pi)
-    #camera.location.x = camera.location.x -0.1
-    #cam.rotation_euler.rotate_axis('Z',5.0/180.0*math.pi)
-    sceneRender()
-    imageGeneration(i,1)
-
-    camera.location.x = camera.location.x - mot2
-    #cam.rotation_euler.rotate_axis('Z',5.0/180.0*math.pi)
-    sceneRender()
-    imageGeneration(i,2)
-    line = str(mot1) + " " + str(mot2)+ "\n"
-    f.write(line)
-
-
-f.close()
+    pos_img = np.stack([r,g,b], 0)
+
+    ### Camera Pos and Pos in Camera ###
+    w2c_t = np.array(bpy.data.objects['Camera'].location).reshape(-1, 1)  # (3,1)
+    w2c_R = R.from_euler('xyz',np.array(bpy.data.objects['Camera'].rotation_euler)).as_matrix()  # (3, WH)
+    pos_c = w2c_R.transpose() @ (rearrange(pos_img, 'pos h w -> pos (h w)') - w2c_t)
+
+    # dist image
+    dist_img = np.linalg.norm(pos_c, axis=0, ord=2)
+    dist_img = rearrange(dist_img, '(h w) -> h w', h=height, w=width)
+    cv.imwrite(rendred_path+"dist.png", dist_img/np.amax(dist_img)*255)
+
+    ##################
+    ### FORM POLAR ###
+    ##################
+    print(">> Start Sonar Image Generation")
+    def getEle(p):  # p(0)->x, p(1)->y, p(2)->z
+        return np.arctan2(p[1], np.sqrt(p[0]**2 + (-p[2])**2))
+    def getAzi(p):  # p(0)->x, p(1)->y, p(2)->z
+        return np.arctan2(p[0], -p[2])
+
+    polar = np.zeros([nbins, nbeams])
+    counter = np.zeros([nbins, nbeams])
+    for i in range(pos_c.shape[1]):
+        # forward -> -z, right -> x, upward -> y
+        p = pos_c[:, i]
+        phi = getEle(p)
+        theta = getAzi(p)
+        r = np.linalg.norm(p)
+
+        # out of bound
+        if phi > vertical_fov/2 or phi < -vertical_fov/2 or \
+            theta > angle_table.ar.max() or theta < angle_table.al.min() or \
+                r > far_bound or r < near_bound:
+                    continue
+
+        # find beam and bin number
+        bin_i = int(np.round((r-near_bound)/distance_resolution))
+        beam_i = int(np.where(angle_table.ar[angle_table.al < theta] > theta)[0])
+
+        polar[bin_i, beam_i] += intensity_img[i]
+        counter[bin_i, beam_i] += 1
+
+    # 暂时先考虑平均
+    counter[np.where(counter==0)] = 1
+    polar /= np.amax(polar)
+    polar /= counter
+    polar /= np.amax(polar)
+
+    ##################
+    ### 打印图片信息 ###
+    ##################
+    print(">> Pics Infos")
+    print('max distances:', np.amax(dist_img))
+    print('min distances:', np.amin(dist_img))
+    print('polar image size: {}x{}'.format(nbeams, nbins))
+
+    # 保存
+    raw_save_path = sonar_path + "polar" + str(num) + ".png"
+    cv.imwrite(raw_save_path, polar*255)
+    cam_xyz = np.array(bpy.data.objects['Camera'].location)
+    cam_rpy = np.array(bpy.data.objects['Camera'].rotation_euler)
+    pose_save_path = sonar_path + "pose" + str(num)+ ".mat"
+    sio.savemat(pose_save_path, {'cam_xyz':cam_xyz, 'cam_rpy':cam_rpy})
+
+
+#################
+### MAIN LOOP ###
+#################
+for i in range(1):
+    renderOnce()
+    imageGeneration(i)
+
+# calculate time cost
 time_end = time.time()
-print('Total cost',time_end-time_start)
+print('Total cost', time_end - time_start)
